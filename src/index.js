@@ -50,6 +50,7 @@ class GraphQLMCPServer {
       {
         capabilities: {
           tools: {},
+          resources: {},
         },
       }
     );
@@ -59,6 +60,12 @@ class GraphQLMCPServer {
     try {
       const fileContent = await fs.readFile(this.exposedConfigPath, 'utf8');
       this.exposedConfig = yaml.parse(fileContent);
+      
+      // Ensure resources section exists for backward compatibility
+      if (!this.exposedConfig.exposed.resources) {
+        this.exposedConfig.exposed.resources = {};
+      }
+      
       console.log('✅ Loaded exposed.yaml configuration');
     } catch (error) {
       if (error.code === 'ENOENT') {
@@ -66,7 +73,8 @@ class GraphQLMCPServer {
         this.exposedConfig = {
           exposed: {
             queries: {},
-            mutations: {}
+            mutations: {},
+            resources: {}
           }
         };
       } else {
@@ -295,7 +303,7 @@ class GraphQLMCPServer {
 
   generateInputSchema(args) {
     if (!args || args.length === 0) {
-      return z.object({}).optional().default({});
+      return {};
     }
 
     const properties = {};
@@ -399,7 +407,8 @@ class GraphQLMCPServer {
       
       const queryFieldCount = queryType ? Object.keys(queryType.getFields()).length : 0;
       const mutationFieldCount = mutationType ? Object.keys(mutationType.getFields()).length : 0;
-      console.log(`🛠️  Discovered ${queryFieldCount} queries and ${mutationFieldCount} mutations`);
+      const configuredResourceCount = Object.keys(this.exposedConfig.exposed.resources).length;
+      console.log(`🛠️  Discovered ${queryFieldCount} queries, ${mutationFieldCount} mutations, and ${configuredResourceCount} configured resources`);
 
       // Track if we need to save the config
       let configUpdated = false;
@@ -418,7 +427,7 @@ class GraphQLMCPServer {
           console.log(`📝 New query discovered: ${fieldName}`);
         }
         
-        // Only register if the query is enabled
+        // Only register as tool if the query is enabled
         if (this.exposedConfig.exposed.queries[fieldName] === true) {
           try {
             const inputSchema = this.generateInputSchema(field.args);
@@ -438,6 +447,7 @@ class GraphQLMCPServer {
               },
               async (args) => {
                 try {
+                  console.log
                   const query = this.buildGraphQLQuery('query', fieldName, field, args);
                   const result = await this.client.request(query, args);
                   
@@ -464,6 +474,51 @@ class GraphQLMCPServer {
         }
       }
       
+      // Register resources for queries explicitly listed in resources section
+      for (const [resourceName, enabled] of Object.entries(this.exposedConfig.exposed.resources)) {
+        if (enabled === true && fields[resourceName]) {
+          const field = fields[resourceName];
+          
+          try {
+            this.server.registerResource(
+              resourceName,
+              `resource://${resourceName}`,
+              {
+                title: resourceName,
+                description: field.description || `GraphQL query resource: ${this.getFieldDescription(field)}`,
+                mimeType: 'application/json',
+              },
+              async (uri) => {
+                try {
+                  console.log(`📊 Fetching resource: ${resourceName} (${uri.href})`);
+                  const query = this.buildGraphQLQuery('query', resourceName, field, {});
+                  const result = await this.client.request(query, {});
+                  console.log(`✅ Resource fetched successfully: ${resourceName}`);
+                  
+                  return {
+                    contents: [
+                      {
+                        uri: uri.href,
+                        mimeType: 'application/json',
+                        text: JSON.stringify(result, null, 2),
+                      },
+                    ],
+                  };
+                } catch (error) {
+                  console.error(`❌ GraphQL resource ${resourceName} failed:`, error);
+                  throw new Error(`GraphQL resource failed: ${error.message}`);
+                }
+              }
+            );
+            console.log(`📊 Registered resource: ${resourceName}`);
+          } catch (error) {
+            console.error(`❌ Failed to register resource ${resourceName}:`, error);
+          }
+        } else if (enabled === true) {
+          console.log(`⚠️  Resource ${resourceName} not found in GraphQL schema`);
+        }
+      }
+      
       // Clean up removed queries
       const currentQueryNames = Object.keys(fields);
       for (const queryName in this.exposedConfig.exposed.queries) {
@@ -471,6 +526,15 @@ class GraphQLMCPServer {
           delete this.exposedConfig.exposed.queries[queryName];
           configUpdated = true;
           console.log(`🗑️  Removed obsolete query: ${queryName}`);
+        }
+      }
+      
+      // Clean up removed resources
+      for (const resourceName in this.exposedConfig.exposed.resources) {
+        if (!currentQueryNames.includes(resourceName)) {
+          delete this.exposedConfig.exposed.resources[resourceName];
+          configUpdated = true;
+          console.log(`🗑️  Removed obsolete resource: ${resourceName}`);
         }
       }
     }
