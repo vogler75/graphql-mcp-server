@@ -568,9 +568,14 @@ class GraphQLMCPServer {
   }
 
   async runStdioServer() {
+    const timestamp = new Date().toISOString();
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('🚀 GraphQL MCP server running on stdio');
+    console.error(`🚀 [${timestamp}] GraphQL MCP Server Started`);
+    console.error(`   └── Transport: STDIO`);
+    console.error(`   └── GraphQL URL: ${this.graphqlUrl}`);
+    console.error(`   └── Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
+    console.error(`📋 Ready to accept MCP requests via STDIO...`);
   }
 
   async runHttpServer(port) {
@@ -578,18 +583,31 @@ class GraphQLMCPServer {
     app.use(express.json());
 
     app.post('/mcp', async (req, res) => {
-      console.log('Received POST MCP request');
+      const timestamp = new Date().toISOString();
+      const clientIP = req.ip || req.connection.remoteAddress || 'unknown';
+      const userAgent = req.get('User-Agent') || 'unknown';
+      const method = req.body?.method || 'unknown';
+      const requestId = req.body?.id || 'N/A';
+      
+      console.log(`📨 [${timestamp}] MCP Request Received`);
+      console.log(`   └── Method: ${method}`);
+      console.log(`   └── Request ID: ${requestId}`);
+      console.log(`   └── Client IP: ${clientIP}`);
+      console.log(`   └── User Agent: ${userAgent.substring(0, 50)}${userAgent.length > 50 ? '...' : ''}`);
+      
       try {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
         });
         res.on('close', () => {
           transport.close();
+          console.log(`🔌 [${new Date().toISOString()}] Connection closed for request ${requestId}`);
         });
         await this.server.connect(transport);
         await transport.handleRequest(req, res, req.body);
+        console.log(`✅ [${new Date().toISOString()}] MCP Request processed successfully (${method}, ID: ${requestId})`);
       } catch (error) {
-        console.error('Error handling MCP request:', error);
+        console.error(`❌ [${new Date().toISOString()}] Error handling MCP request (${method}, ID: ${requestId}):`, error.message);
         if (!res.headersSent) {
           res.status(500).json({
             jsonrpc: '2.0',
@@ -604,7 +622,15 @@ class GraphQLMCPServer {
     });
 
     app.get('/mcp', async (req, res) => {
-      console.log('Received GET MCP request');
+      const timestamp = new Date().toISOString();
+      const clientIP = req.ip || req.connection.remoteAddress || 'unknown';
+      const userAgent = req.get('User-Agent') || 'unknown';
+      
+      console.log(`🚫 [${timestamp}] Invalid MCP Request - GET Method Not Allowed`);
+      console.log(`   └── Client IP: ${clientIP}`);
+      console.log(`   └── User Agent: ${userAgent.substring(0, 50)}${userAgent.length > 50 ? '...' : ''}`);
+      console.log(`   └── Expected: POST request to /mcp endpoint`);
+      
       res.writeHead(405).end(JSON.stringify({
         jsonrpc: "2.0",
         error: {
@@ -616,7 +642,15 @@ class GraphQLMCPServer {
     });
 
     app.delete('/mcp', async (req, res) => {
-      console.log('Received DELETE MCP request');
+      const timestamp = new Date().toISOString();
+      const clientIP = req.ip || req.connection.remoteAddress || 'unknown';
+      const userAgent = req.get('User-Agent') || 'unknown';
+      
+      console.log(`🚫 [${timestamp}] Invalid MCP Request - DELETE Method Not Allowed`);
+      console.log(`   └── Client IP: ${clientIP}`);
+      console.log(`   └── User Agent: ${userAgent.substring(0, 50)}${userAgent.length > 50 ? '...' : ''}`);
+      console.log(`   └── Expected: POST request to /mcp endpoint`);
+      
       res.writeHead(405).end(JSON.stringify({
         jsonrpc: "2.0",
         error: {
@@ -628,8 +662,14 @@ class GraphQLMCPServer {
     });
 
     app.listen(port, () => {
-      console.log(`🚀 GraphQL MCP server listening on port ${port}`);
+      const timestamp = new Date().toISOString();
+      console.log(`🚀 [${timestamp}] GraphQL MCP Server Started`);
+      console.log(`   └── Transport: HTTP`);
+      console.log(`   └── Port: ${port}`);
+      console.log(`   └── GraphQL URL: ${this.graphqlUrl}`);
+      console.log(`   └── Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
       console.log(`📡 MCP endpoint: http://localhost:${port}/mcp`);
+      console.log(`📋 Ready to accept MCP requests...`);
     });
   }
 }
