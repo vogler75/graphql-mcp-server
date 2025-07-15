@@ -23,9 +23,11 @@ if (!GRAPHQL_URL) {
 }
 
 class GraphQLMCPServer {
-  constructor() {
+  constructor(queryPrefix = '', mutationPrefix = '') {
     this.client = new GraphQLClient(GRAPHQL_URL);
     this.schema = null;
+    this.queryPrefix = queryPrefix;
+    this.mutationPrefix = mutationPrefix;
     this.server = new McpServer(
       {
         name: 'graphql-mcp-server',
@@ -41,7 +43,7 @@ class GraphQLMCPServer {
 
   async fetchSchema() {
     try {
-      console.log('Fetching GraphQL schema from:', GRAPHQL_URL);
+      console.log('🔍 Fetching GraphQL schema from:', GRAPHQL_URL);
       const introspectionQuery = getIntrospectionQuery();
       const result = await this.client.request(introspectionQuery);
       
@@ -50,9 +52,9 @@ class GraphQLMCPServer {
       }
       
       this.schema = buildClientSchema(result);
-      console.log('GraphQL schema fetched successfully');
+      console.log('✅ GraphQL schema fetched successfully');
     } catch (error) {
-      console.error('Failed to fetch GraphQL schema:', error);
+      console.error('❌ Failed to fetch GraphQL schema:', error);
       throw error;
     }
   }
@@ -325,10 +327,9 @@ class GraphQLMCPServer {
         }
         
         properties[key] = zodType;
-        console.log(`Successfully processed arg ${key}`);
       }
 
-      console.log('generateInputSchema completed, properties:', Object.keys(properties));
+      // Remove verbose logging
       // Return the properties object directly, not wrapped in z.object()
       // The MCP SDK expects a plain object with Zod schemas as values
       return properties;
@@ -347,34 +348,24 @@ class GraphQLMCPServer {
       const queryType = this.schema.getQueryType();
       const mutationType = this.schema.getMutationType();
       
-      console.log('Schema types found:', {
-        hasQueryType: !!queryType,
-        hasMutationType: !!mutationType,
-        queryFields: queryType ? Object.keys(queryType.getFields()).length : 0,
-        mutationFields: mutationType ? Object.keys(mutationType.getFields()).length : 0
-      });
+      const queryFieldCount = queryType ? Object.keys(queryType.getFields()).length : 0;
+      const mutationFieldCount = mutationType ? Object.keys(mutationType.getFields()).length : 0;
+      console.log(`🛠️  Discovered ${queryFieldCount} queries and ${mutationFieldCount} mutations`);
 
     if (queryType) {
-      console.log('Processing query type...');
       const fields = queryType.getFields();
-      console.log('Query fields:', Object.keys(fields));
       
       for (const [fieldName, field] of Object.entries(fields)) {
-        console.log(`Processing query field: ${fieldName}`);
-        const toolName = `query_${fieldName}`;
+        const toolName = `${this.queryPrefix}${fieldName}`;
         
         try {
-          console.log(`Generating input schema for query ${fieldName}...`);
           const inputSchema = this.generateInputSchema(field.args);
-          console.log(`Input schema generated for query ${fieldName}`);
           
           // Validate the input schema before registering
           if (!inputSchema || typeof inputSchema !== 'object') {
-            console.error(`Invalid input schema for ${toolName}:`, inputSchema);
+            console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
             throw new Error(`Invalid input schema generated for ${toolName}`);
           }
-          
-          console.log(`Registering tool ${toolName} with schema keys:`, Object.keys(inputSchema));
           
           this.server.registerTool(
             toolName,
@@ -385,9 +376,7 @@ class GraphQLMCPServer {
             },
             async (args) => {
               try {
-                console.log(`Executing query ${fieldName} with args:`, args);
                 const query = this.buildGraphQLQuery('query', fieldName, field, args);
-                console.log('Generated query:', query);
                 const result = await this.client.request(query, args);
                 
                 return {
@@ -399,39 +388,32 @@ class GraphQLMCPServer {
                   ],
                 };
               } catch (error) {
-                console.error(`GraphQL query ${fieldName} failed:`, error);
+                console.error(`❌ GraphQL query ${fieldName} failed:`, error);
                 throw new Error(`GraphQL query failed: ${error.message}`);
               }
             }
           );
-          console.log(`Registered query tool: ${toolName}`);
+          console.log(`🔧 Registered query: ${toolName}`);
         } catch (error) {
-          console.error(`Failed to register query tool ${toolName}:`, error);
+          console.error(`❌ Failed to register query tool ${toolName}:`, error);
         }
       }
     }
 
     if (mutationType) {
-      console.log('Processing mutation type...');
       const fields = mutationType.getFields();
-      console.log('Mutation fields:', Object.keys(fields));
       
       for (const [fieldName, field] of Object.entries(fields)) {
-        console.log(`Processing mutation field: ${fieldName}`);
-        const toolName = `mutation_${fieldName}`;
+        const toolName = `${this.mutationPrefix}${fieldName}`;
         
         try {
-          console.log(`Generating input schema for mutation ${fieldName}...`);
           const inputSchema = this.generateInputSchema(field.args);
-          console.log(`Input schema generated for mutation ${fieldName}`);
           
           // Validate the input schema before registering
           if (!inputSchema || typeof inputSchema !== 'object') {
-            console.error(`Invalid input schema for ${toolName}:`, inputSchema);
+            console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
             throw new Error(`Invalid input schema generated for ${toolName}`);
           }
-          
-          console.log(`Registering tool ${toolName} with schema keys:`, Object.keys(inputSchema));
           
           this.server.registerTool(
             toolName,
@@ -442,9 +424,7 @@ class GraphQLMCPServer {
             },
             async (args) => {
               try {
-                console.log(`Executing mutation ${fieldName} with args:`, args);
                 const query = this.buildGraphQLQuery('mutation', fieldName, field, args);
-                console.log('Generated mutation:', query);
                 const result = await this.client.request(query, args);
                 
                 return {
@@ -456,14 +436,14 @@ class GraphQLMCPServer {
                   ],
                 };
               } catch (error) {
-                console.error(`GraphQL mutation ${fieldName} failed:`, error);
+                console.error(`❌ GraphQL mutation ${fieldName} failed:`, error);
                 throw new Error(`GraphQL mutation failed: ${error.message}`);
               }
             }
           );
-          console.log(`Registered mutation tool: ${toolName}`);
+          console.log(`🔧 Registered mutation: ${toolName}`);
         } catch (error) {
-          console.error(`Failed to register mutation tool ${toolName}:`, error);
+          console.error(`❌ Failed to register mutation tool ${toolName}:`, error);
         }
       }
     }
@@ -487,7 +467,7 @@ class GraphQLMCPServer {
   async runStdioServer() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('GraphQL MCP server running on stdio');
+    console.error('🚀 GraphQL MCP server running on stdio');
   }
 
   async runHttpServer(port) {
@@ -545,8 +525,8 @@ class GraphQLMCPServer {
     });
 
     app.listen(port, () => {
-      console.log(`GraphQL MCP server listening on port ${port}`);
-      console.log(`MCP endpoint: http://localhost:${port}/mcp`);
+      console.log(`🚀 GraphQL MCP server listening on port ${port}`);
+      console.log(`📡 MCP endpoint: http://localhost:${port}/mcp`);
     });
   }
 }
@@ -555,7 +535,9 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const config = {
     transport: 'stdio',
-    port: 3000
+    port: 3000,
+    queryPrefix: '',
+    mutationPrefix: ''
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -568,6 +550,14 @@ function parseArgs() {
       case '-p':
         config.port = parseInt(args[++i]);
         break;
+      case '--query-prefix':
+      case '-q':
+        config.queryPrefix = args[++i];
+        break;
+      case '--mutation-prefix':
+      case '-m':
+        config.mutationPrefix = args[++i];
+        break;
       case '--help':
       case '-h':
         console.log(`
@@ -576,9 +566,11 @@ GraphQL MCP Server
 Usage: node src/index.js [options]
 
 Options:
-  -t, --transport <type>  Transport type: stdio or http (default: stdio)
-  -p, --port <number>     HTTP port (default: 3000)
-  -h, --help             Show this help message
+  -t, --transport <type>     Transport type: stdio or http (default: stdio)
+  -p, --port <number>        HTTP port (default: 3000)
+  -q, --query-prefix <str>   Prefix for query tools (default: none)
+  -m, --mutation-prefix <str> Prefix for mutation tools (default: none)
+  -h, --help                 Show this help message
 
 Environment Variables:
   GRAPHQL_URL            GraphQL endpoint URL (required)
@@ -587,6 +579,8 @@ Examples:
   node src/index.js                           # Run with stdio transport
   node src/index.js -t http                   # Run with HTTP transport on port 3000
   node src/index.js -t http -p 8080          # Run with HTTP transport on port 8080
+  node src/index.js -q 'query_' -m 'mutation_' # Add prefixes
+  node src/index.js -q 'q_' -m 'mut_'        # Custom prefixes
 `);
         process.exit(0);
         break;
@@ -602,5 +596,5 @@ Examples:
 }
 
 const config = parseArgs();
-const graphqlServer = new GraphQLMCPServer();
+const graphqlServer = new GraphQLMCPServer(config.queryPrefix, config.mutationPrefix);
 graphqlServer.run(config.transport, config.port).catch(console.error);
