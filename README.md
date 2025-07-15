@@ -9,6 +9,39 @@ A Model Context Protocol (MCP) server that dynamically generates tools for any G
 - Type-safe variable handling
 - Automatic query generation with smart field selection
 - Error handling and validation
+- **Function exposure control via exposed.yaml**
+- **Bearer token authentication support**
+
+## Function Exposure Control
+
+The server automatically manages which GraphQL functions are exposed as MCP tools through an `exposed.yaml` file:
+
+### How it works
+
+1. **First run**: Server discovers all GraphQL queries and mutations, creates `exposed.yaml` with all functions set to `true`
+2. **Subsequent runs**: Only functions marked as `true` in `exposed.yaml` are registered as MCP tools
+3. **Dynamic updates**: New functions are automatically added to the file with default `true` value
+4. **Cleanup**: Functions that no longer exist in the schema are removed from the file
+
+### exposed.yaml format
+
+```yaml
+exposed:
+  queries:
+    getUser: true
+    listPosts: false
+    searchContent: true
+  mutations:
+    createUser: true
+    deleteUser: false
+    updatePost: true
+```
+
+### Managing exposed functions
+
+- Set a function to `false` to disable it (won't be registered as MCP tool)
+- Set a function to `true` to enable it (will be registered as MCP tool)
+- The file is automatically updated when the schema changes
 
 ## Installation
 
@@ -18,10 +51,31 @@ npm install
 
 ## Configuration
 
-Set the GraphQL endpoint URL via environment variable:
+### GraphQL Endpoint
+
+Set the GraphQL endpoint URL via environment variable or command line argument:
 
 ```bash
+# Via environment variable
 export GRAPHQL_URL="https://api.example.com/graphql"
+
+# Via command line argument
+node src/index.js --graphql-url "https://api.example.com/graphql"
+```
+
+### Authentication
+
+For APIs requiring Bearer token authentication:
+
+```bash
+# Via environment variable
+export GRAPHQL_TOKEN="your-bearer-token"
+
+# Via command line argument
+node src/index.js --token "your-bearer-token"
+
+# Both URL and token as arguments
+node src/index.js --graphql-url "https://api.example.com/graphql" --token "your-bearer-token"
 ```
 
 ## Usage
@@ -61,9 +115,13 @@ npm run dev:http
 node src/index.js [options]
 
 Options:
-  -t, --transport <type>  Transport type: stdio or http (default: stdio)
-  -p, --port <number>     HTTP port (default: 3000)
-  -h, --help             Show help message
+  -t, --transport <type>     Transport type: stdio or http (default: stdio)
+  -p, --port <number>        HTTP port (default: 3000)
+  -u, --graphql-url <url>    GraphQL endpoint URL
+  -T, --token <token>        Bearer token for authentication
+  -q, --query-prefix <str>   Prefix for query tools (default: none)
+  -m, --mutation-prefix <str> Prefix for mutation tools (default: none)
+  -h, --help                 Show help message
 ```
 
 ### Integration with Claude Desktop
@@ -78,8 +136,26 @@ Add to your Claude Desktop configuration:
       "command": "node",
       "args": ["/path/to/graphql-mcp-server/src/index.js"],
       "env": {
-        "GRAPHQL_URL": "https://api.example.com/graphql"
+        "GRAPHQL_URL": "https://api.example.com/graphql",
+        "GRAPHQL_TOKEN": "your-bearer-token"
       }
+    }
+  }
+}
+```
+
+**Alternative using command line arguments:**
+
+```json
+{
+  "mcpServers": {
+    "graphql": {
+      "command": "node",
+      "args": [
+        "/path/to/graphql-mcp-server/src/index.js",
+        "--graphql-url", "https://api.example.com/graphql",
+        "--token", "your-bearer-token"
+      ]
     }
   }
 }
@@ -89,8 +165,11 @@ Add to your Claude Desktop configuration:
 For HTTP transport, start the server separately:
 
 ```bash
-# Start the server
-GRAPHQL_URL="https://api.example.com/graphql" node src/index.js --transport http --port 3000
+# Start the server with environment variables
+GRAPHQL_URL="https://api.example.com/graphql" GRAPHQL_TOKEN="your-bearer-token" node src/index.js --transport http --port 3000
+
+# Or using command line arguments
+node src/index.js --transport http --port 3000 --graphql-url "https://api.example.com/graphql" --token "your-bearer-token"
 ```
 
 Then configure your MCP client to connect to the HTTP endpoint at `http://localhost:3000/mcp`.
@@ -130,17 +209,32 @@ curl -X POST http://localhost:3000/mcp \
 
 ## How it works
 
-1. On startup, the server connects to the specified GraphQL endpoint
-2. It performs an introspection query to fetch the complete schema
-3. For each query and mutation in the schema, it generates a corresponding MCP tool
-4. Tools are named with prefixes: `query_` for queries and `mutation_` for mutations
-5. When a tool is called, it constructs the appropriate GraphQL query/mutation and executes it
-6. Results are returned as formatted JSON
+1. On startup, the server connects to the specified GraphQL endpoint (with optional Bearer token authentication)
+2. It loads the `exposed.yaml` configuration file (creates it if it doesn't exist)
+3. It performs an introspection query to fetch the complete schema
+4. For each query and mutation in the schema, it checks if the function is enabled in `exposed.yaml`
+5. Only enabled functions are registered as MCP tools with prefixes: `query_` for queries and `mutation_` for mutations
+6. New functions discovered in the schema are automatically added to `exposed.yaml` as enabled
+7. When a tool is called, it constructs the appropriate GraphQL query/mutation and executes it
+8. Results are returned as formatted JSON
 
 ## Tool naming convention
 
 - Queries: `query_<fieldName>` (e.g., `query_getUser`, `query_listPosts`)
 - Mutations: `mutation_<fieldName>` (e.g., `mutation_createUser`, `mutation_updatePost`)
+
+## Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GRAPHQL_URL` | GraphQL endpoint URL | Yes (if not provided via `--graphql-url`) |
+| `GRAPHQL_TOKEN` | Bearer token for authentication | No |
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `exposed.yaml` | Configuration file controlling which GraphQL functions are exposed as MCP tools |
 
 ## Transport Protocols
 

@@ -14,20 +14,34 @@ import {
   isObjectType,
   isEnumType,
 } from 'graphql';
+import yaml from 'yaml';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-const GRAPHQL_URL = process.env.GRAPHQL_URL;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-if (!GRAPHQL_URL) {
-  console.error('Error: GRAPHQL_URL environment variable is required');
-  process.exit(1);
-}
+const GRAPHQL_TOKEN = process.env.GRAPHQL_TOKEN;
 
 class GraphQLMCPServer {
-  constructor(queryPrefix = '', mutationPrefix = '') {
-    this.client = new GraphQLClient(GRAPHQL_URL);
+  constructor(graphqlUrl, queryPrefix = '', mutationPrefix = '', token = null) {
+    if (!graphqlUrl) {
+      throw new Error('GraphQL URL is required');
+    }
+    
+    const headers = {};
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    
+    this.client = new GraphQLClient(graphqlUrl, { headers });
+    this.graphqlUrl = graphqlUrl;
     this.schema = null;
     this.queryPrefix = queryPrefix;
     this.mutationPrefix = mutationPrefix;
+    this.exposedConfigPath = path.join(process.cwd(), 'exposed.yaml');
+    this.exposedConfig = null;
     this.server = new McpServer(
       {
         name: 'graphql-mcp-server',
@@ -41,9 +55,41 @@ class GraphQLMCPServer {
     );
   }
 
+  async loadExposedConfig() {
+    try {
+      const fileContent = await fs.readFile(this.exposedConfigPath, 'utf8');
+      this.exposedConfig = yaml.parse(fileContent);
+      console.log('✅ Loaded exposed.yaml configuration');
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        console.log('📝 exposed.yaml not found, will create new configuration');
+        this.exposedConfig = {
+          exposed: {
+            queries: {},
+            mutations: {}
+          }
+        };
+      } else {
+        console.error('❌ Error loading exposed.yaml:', error);
+        throw error;
+      }
+    }
+  }
+
+  async saveExposedConfig() {
+    try {
+      const yamlContent = yaml.stringify(this.exposedConfig);
+      await fs.writeFile(this.exposedConfigPath, yamlContent, 'utf8');
+      console.log('✅ Saved exposed.yaml configuration');
+    } catch (error) {
+      console.error('❌ Error saving exposed.yaml:', error);
+      throw error;
+    }
+  }
+
   async fetchSchema() {
     try {
-      console.log('🔍 Fetching GraphQL schema from:', GRAPHQL_URL);
+      console.log('🔍 Fetching GraphQL schema from:', this.graphqlUrl);
       const introspectionQuery = getIntrospectionQuery();
       const result = await this.client.request(introspectionQuery);
       
@@ -337,6 +383,9 @@ class GraphQLMCPServer {
 
   async setupTools() {
     try {
+      // Load exposed configuration first
+      await this.loadExposedConfig();
+
       if (!this.schema) {
         await this.fetchSchema();
       }
@@ -352,50 +401,76 @@ class GraphQLMCPServer {
       const mutationFieldCount = mutationType ? Object.keys(mutationType.getFields()).length : 0;
       console.log(`🛠️  Discovered ${queryFieldCount} queries and ${mutationFieldCount} mutations`);
 
+      // Track if we need to save the config
+      let configUpdated = false;
+
     if (queryType) {
       const fields = queryType.getFields();
       
       for (const [fieldName, field] of Object.entries(fields)) {
         const toolName = `${this.queryPrefix}${fieldName}`;
         
-        try {
-          const inputSchema = this.generateInputSchema(field.args);
-          
-          // Validate the input schema before registering
-          if (!inputSchema || typeof inputSchema !== 'object') {
-            console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
-            throw new Error(`Invalid input schema generated for ${toolName}`);
-          }
-          
-          this.server.registerTool(
-            toolName,
-            {
-              title: `GraphQL Query: ${fieldName}`,
-              description: field.description || `Execute GraphQL query: ${this.getFieldDescription(field)}`,
-              inputSchema: inputSchema,
-            },
-            async (args) => {
-              try {
-                const query = this.buildGraphQLQuery('query', fieldName, field, args);
-                const result = await this.client.request(query, args);
-                
-                return {
-                  content: [
-                    {
-                      type: 'text',
-                      text: JSON.stringify(result, null, 2),
-                    },
-                  ],
-                };
-              } catch (error) {
-                console.error(`❌ GraphQL query ${fieldName} failed:`, error);
-                throw new Error(`GraphQL query failed: ${error.message}`);
-              }
+        // Check if this query is in the exposed config
+        if (!(fieldName in this.exposedConfig.exposed.queries)) {
+          // New query discovered, add it to config with default true
+          this.exposedConfig.exposed.queries[fieldName] = true;
+          configUpdated = true;
+          console.log(`📝 New query discovered: ${fieldName}`);
+        }
+        
+        // Only register if the query is enabled
+        if (this.exposedConfig.exposed.queries[fieldName] === true) {
+          try {
+            const inputSchema = this.generateInputSchema(field.args);
+            
+            // Validate the input schema before registering
+            if (!inputSchema || typeof inputSchema !== 'object') {
+              console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
+              throw new Error(`Invalid input schema generated for ${toolName}`);
             }
-          );
-          console.log(`🔧 Registered query: ${toolName}`);
-        } catch (error) {
-          console.error(`❌ Failed to register query tool ${toolName}:`, error);
+            
+            this.server.registerTool(
+              toolName,
+              {
+                title: `GraphQL Query: ${fieldName}`,
+                description: field.description || `Execute GraphQL query: ${this.getFieldDescription(field)}`,
+                inputSchema: inputSchema,
+              },
+              async (args) => {
+                try {
+                  const query = this.buildGraphQLQuery('query', fieldName, field, args);
+                  const result = await this.client.request(query, args);
+                  
+                  return {
+                    content: [
+                      {
+                        type: 'text',
+                        text: JSON.stringify(result, null, 2),
+                      },
+                    ],
+                  };
+                } catch (error) {
+                  console.error(`❌ GraphQL query ${fieldName} failed:`, error);
+                  throw new Error(`GraphQL query failed: ${error.message}`);
+                }
+              }
+            );
+            console.log(`🔧 Registered query: ${toolName}`);
+          } catch (error) {
+            console.error(`❌ Failed to register query tool ${toolName}:`, error);
+          }
+        } else {
+          console.log(`⏭️  Skipped disabled query: ${fieldName}`);
+        }
+      }
+      
+      // Clean up removed queries
+      const currentQueryNames = Object.keys(fields);
+      for (const queryName in this.exposedConfig.exposed.queries) {
+        if (!currentQueryNames.includes(queryName)) {
+          delete this.exposedConfig.exposed.queries[queryName];
+          configUpdated = true;
+          console.log(`🗑️  Removed obsolete query: ${queryName}`);
         }
       }
     }
@@ -406,46 +481,74 @@ class GraphQLMCPServer {
       for (const [fieldName, field] of Object.entries(fields)) {
         const toolName = `${this.mutationPrefix}${fieldName}`;
         
-        try {
-          const inputSchema = this.generateInputSchema(field.args);
-          
-          // Validate the input schema before registering
-          if (!inputSchema || typeof inputSchema !== 'object') {
-            console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
-            throw new Error(`Invalid input schema generated for ${toolName}`);
-          }
-          
-          this.server.registerTool(
-            toolName,
-            {
-              title: `GraphQL Mutation: ${fieldName}`,
-              description: field.description || `Execute GraphQL mutation: ${this.getFieldDescription(field)}`,
-              inputSchema: inputSchema,
-            },
-            async (args) => {
-              try {
-                const query = this.buildGraphQLQuery('mutation', fieldName, field, args);
-                const result = await this.client.request(query, args);
-                
-                return {
-                  content: [
-                    {
-                      type: 'text',
-                      text: JSON.stringify(result, null, 2),
-                    },
-                  ],
-                };
-              } catch (error) {
-                console.error(`❌ GraphQL mutation ${fieldName} failed:`, error);
-                throw new Error(`GraphQL mutation failed: ${error.message}`);
-              }
+        // Check if this mutation is in the exposed config
+        if (!(fieldName in this.exposedConfig.exposed.mutations)) {
+          // New mutation discovered, add it to config with default true
+          this.exposedConfig.exposed.mutations[fieldName] = true;
+          configUpdated = true;
+          console.log(`📝 New mutation discovered: ${fieldName}`);
+        }
+        
+        // Only register if the mutation is enabled
+        if (this.exposedConfig.exposed.mutations[fieldName] === true) {
+          try {
+            const inputSchema = this.generateInputSchema(field.args);
+            
+            // Validate the input schema before registering
+            if (!inputSchema || typeof inputSchema !== 'object') {
+              console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
+              throw new Error(`Invalid input schema generated for ${toolName}`);
             }
-          );
-          console.log(`🔧 Registered mutation: ${toolName}`);
-        } catch (error) {
-          console.error(`❌ Failed to register mutation tool ${toolName}:`, error);
+            
+            this.server.registerTool(
+              toolName,
+              {
+                title: `GraphQL Mutation: ${fieldName}`,
+                description: field.description || `Execute GraphQL mutation: ${this.getFieldDescription(field)}`,
+                inputSchema: inputSchema,
+              },
+              async (args) => {
+                try {
+                  const query = this.buildGraphQLQuery('mutation', fieldName, field, args);
+                  const result = await this.client.request(query, args);
+                  
+                  return {
+                    content: [
+                      {
+                        type: 'text',
+                        text: JSON.stringify(result, null, 2),
+                      },
+                    ],
+                  };
+                } catch (error) {
+                  console.error(`❌ GraphQL mutation ${fieldName} failed:`, error);
+                  throw new Error(`GraphQL mutation failed: ${error.message}`);
+                }
+              }
+            );
+            console.log(`🔧 Registered mutation: ${toolName}`);
+          } catch (error) {
+            console.error(`❌ Failed to register mutation tool ${toolName}:`, error);
+          }
+        } else {
+          console.log(`⏭️  Skipped disabled mutation: ${fieldName}`);
         }
       }
+      
+      // Clean up removed mutations
+      const currentMutationNames = Object.keys(fields);
+      for (const mutationName in this.exposedConfig.exposed.mutations) {
+        if (!currentMutationNames.includes(mutationName)) {
+          delete this.exposedConfig.exposed.mutations[mutationName];
+          configUpdated = true;
+          console.log(`🗑️  Removed obsolete mutation: ${mutationName}`);
+        }
+      }
+    }
+    
+    // Save configuration if it was updated
+    if (configUpdated) {
+      await this.saveExposedConfig();
     }
     } catch (error) {
       console.error('Error in setupTools:', error);
@@ -537,7 +640,9 @@ function parseArgs() {
     transport: 'stdio',
     port: 3000,
     queryPrefix: '',
-    mutationPrefix: ''
+    mutationPrefix: '',
+    graphqlUrl: process.env.GRAPHQL_URL,
+    token: GRAPHQL_TOKEN
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -558,6 +663,14 @@ function parseArgs() {
       case '-m':
         config.mutationPrefix = args[++i];
         break;
+      case '--graphql-url':
+      case '-u':
+        config.graphqlUrl = args[++i];
+        break;
+      case '--token':
+      case '-T':
+        config.token = args[++i];
+        break;
       case '--help':
       case '-h':
         console.log(`
@@ -570,17 +683,20 @@ Options:
   -p, --port <number>        HTTP port (default: 3000)
   -q, --query-prefix <str>   Prefix for query tools (default: none)
   -m, --mutation-prefix <str> Prefix for mutation tools (default: none)
+  -u, --graphql-url <url>    GraphQL endpoint URL
+  -T, --token <token>        Bearer token for authentication
   -h, --help                 Show this help message
 
 Environment Variables:
-  GRAPHQL_URL            GraphQL endpoint URL (required)
+  GRAPHQL_URL            GraphQL endpoint URL (required if not provided via --graphql-url)
+  GRAPHQL_TOKEN          Bearer token for authentication (optional)
 
 Examples:
-  node src/index.js                           # Run with stdio transport
-  node src/index.js -t http                   # Run with HTTP transport on port 3000
-  node src/index.js -t http -p 8080          # Run with HTTP transport on port 8080
-  node src/index.js -q 'query_' -m 'mutation_' # Add prefixes
-  node src/index.js -q 'q_' -m 'mut_'        # Custom prefixes
+  node src/index.js -u https://api.example.com/graphql  # Specify GraphQL URL
+  node src/index.js -t http -u https://api.example.com/graphql  # HTTP transport
+  node src/index.js -u https://api.example.com/graphql -T abc123  # With Bearer token
+  node src/index.js -q 'query_' -m 'mutation_' -u https://api.example.com/graphql  # With prefixes
+  GRAPHQL_URL=https://api.example.com/graphql node src/index.js  # Using env var
 `);
         process.exit(0);
         break;
@@ -592,9 +708,14 @@ Examples:
     process.exit(1);
   }
 
+  if (!config.graphqlUrl) {
+    console.error('Error: GraphQL URL is required. Provide via --graphql-url argument or GRAPHQL_URL environment variable');
+    process.exit(1);
+  }
+
   return config;
 }
 
 const config = parseArgs();
-const graphqlServer = new GraphQLMCPServer(config.queryPrefix, config.mutationPrefix);
+const graphqlServer = new GraphQLMCPServer(config.graphqlUrl, config.queryPrefix, config.mutationPrefix, config.token);
 graphqlServer.run(config.transport, config.port).catch(console.error);
