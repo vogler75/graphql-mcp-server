@@ -646,6 +646,41 @@ class GraphQLMCPServer {
     const app = express();
     app.use(express.json());
 
+    // Authentication middleware
+    const authToken = process.env.AUTH_TOKEN;
+    if (authToken) {
+      app.use((req, res, next) => {
+        const authHeader = req.headers.authorization;
+        
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Missing Bearer token`);
+          return res.status(401).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32001,
+              message: 'Unauthorized: Bearer token required',
+            },
+            id: null,
+          });
+        }
+        
+        const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+        if (token !== authToken) {
+          console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Invalid token`);
+          return res.status(401).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32001,
+              message: 'Unauthorized: Invalid token',
+            },
+            id: null,
+          });
+        }
+        
+        next();
+      });
+    }
+
     app.post('/mcp', async (req, res) => {
       const timestamp = new Date().toISOString();
       const clientIP = req.ip || req.connection.remoteAddress || 'unknown';
@@ -731,7 +766,8 @@ class GraphQLMCPServer {
       console.log(`   └── Transport: HTTP`);
       console.log(`   └── Port: ${port}`);
       console.log(`   └── GraphQL URL: ${this.graphqlUrl}`);
-      console.log(`   └── Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
+      console.log(`   └── GraphQL Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
+      console.log(`   └── MCP Authentication: ${authToken ? 'Bearer Token Required' : 'None (Open Access)'}`);
       console.log(`📡 MCP endpoint: http://localhost:${port}/mcp`);
       console.log(`📋 Ready to accept MCP requests...`);
     });

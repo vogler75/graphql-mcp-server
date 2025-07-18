@@ -63,9 +63,9 @@ export GRAPHQL_URL="https://api.example.com/graphql"
 node src/index.js --graphql-url "https://api.example.com/graphql"
 ```
 
-### Authentication
+### GraphQL API Authentication
 
-For APIs requiring Bearer token authentication:
+For GraphQL APIs requiring Bearer token authentication:
 
 ```bash
 # Via environment variable
@@ -174,6 +174,25 @@ node src/index.js --transport http --port 3000 --graphql-url "https://api.exampl
 
 Then configure your MCP client to connect to the HTTP endpoint at `http://localhost:3000/mcp`.
 
+### MCP Server Authentication (HTTP Transport)
+
+When using HTTP transport, you can secure the MCP server with bearer token authentication:
+
+```bash
+# Set AUTH_TOKEN environment variable
+export AUTH_TOKEN="your-mcp-secret-token"
+node src/index.js --transport http
+
+# Or in docker-compose.yml
+environment:
+  - AUTH_TOKEN=your-mcp-secret-token
+```
+
+When `AUTH_TOKEN` is set:
+- All HTTP requests to the MCP server must include: `Authorization: Bearer your-mcp-secret-token`
+- Requests without valid tokens receive 401 Unauthorized
+- If `AUTH_TOKEN` is not set, the server allows open access (no authentication required)
+
 ### HTTP API Endpoints
 
 When running with HTTP transport:
@@ -184,9 +203,15 @@ When running with HTTP transport:
 #### Example HTTP Usage
 
 ```bash
-# List available tools
+# Without authentication (when AUTH_TOKEN is not set)
 curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
+
+# With authentication (when AUTH_TOKEN is set)
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-mcp-secret-token" \
   -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
 
 # Call a GraphQL query tool
@@ -228,7 +253,8 @@ curl -X POST http://localhost:3000/mcp \
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `GRAPHQL_URL` | GraphQL endpoint URL | Yes (if not provided via `--graphql-url`) |
-| `GRAPHQL_TOKEN` | Bearer token for authentication | No |
+| `GRAPHQL_TOKEN` | Bearer token for GraphQL API authentication | No |
+| `AUTH_TOKEN` | Bearer token for MCP server authentication (HTTP transport only) | No |
 
 ## Files
 
