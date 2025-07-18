@@ -1,6 +1,4 @@
 exposed:
-  queries:
-
-  mutations:
-
-  resources:
+  queries: {}
+  mutations: {}
+  resources: {}
