@@ -23,7 +23,7 @@ services:
     
     # Mount config file if using external configuration
     volumes:
-      - ./expose.yaml:/app/expose.yaml:ro
+      - ./exposed.yaml:/app/exposed.yaml
     
     # Restart policy
     restart: unless-stopped
