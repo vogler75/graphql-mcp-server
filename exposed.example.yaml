@@ -1,4 +1,25 @@
 exposed:
-  queries: {}
-  mutations: {}
   resources: {}
+  queries:
+    - api.dp.get
+    - api.dp.names
+    - api.dp.types
+    - api.dp.exists
+    - api.dp.getPeriod
+    - api.dp.query
+    - api.dp.getAlias
+    - api.dp.getDescription
+    - api.dp.getFormat
+    - api.dp.getUnit
+  mutations:
+    - api.dp.create
+    - api.dp.delete
+    - api.dp.copy
+    - api.dp.set
+    - api.dp.setAlias
+    - api.dp.setDescription
+    - api.dp.setFormat
+    - api.dp.setUnit
+    - api.dpType.create
+    - api.dpType.change
+    - api.dpType.delete

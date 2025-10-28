@@ -1,1 +1,1 @@
-node src/index.js -t http -p 3000 -u http://winccoa:4000/graphql
+node src/index.js -t http -u http://localhost:4000/graphql $@

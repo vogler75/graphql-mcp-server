@@ -1,0 +1,1 @@
+./run_server.sh --u http://localhost:4000/graphql -p 8001 -t http
