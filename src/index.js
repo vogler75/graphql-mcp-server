@@ -50,7 +50,9 @@ class GraphQLMCPServer {
       {
         capabilities: {
           tools: {},
-          resources: {},
+          resources: {
+            listChanged: true,
+          },
         },
       }
     );
@@ -60,23 +62,11 @@ class GraphQLMCPServer {
     try {
       const fileContent = await fs.readFile(this.exposedConfigPath, 'utf8');
       this.exposedConfig = yaml.parse(fileContent);
-      
-      // Ensure resources section exists for backward compatibility
-      if (!this.exposedConfig.exposed.resources) {
-        this.exposedConfig.exposed.resources = {};
-      }
-      
       console.log('✅ Loaded exposed.yaml configuration');
     } catch (error) {
       if (error.code === 'ENOENT') {
-        console.log('📝 exposed.yaml not found, will create new configuration');
-        this.exposedConfig = {
-          exposed: {
-            queries: {},
-            mutations: {},
-            resources: {}
-          }
-        };
+        console.error('❌ exposed.yaml not found - it is required');
+        throw error;
       } else {
         console.error('❌ Error loading exposed.yaml:', error);
         throw error;
@@ -84,15 +74,35 @@ class GraphQLMCPServer {
     }
   }
 
-  async saveExposedConfig() {
-    try {
-      const yamlContent = yaml.stringify(this.exposedConfig);
-      await fs.writeFile(this.exposedConfigPath, yamlContent, 'utf8');
-      console.log('✅ Saved exposed.yaml configuration');
-    } catch (error) {
-      console.error('❌ Error saving exposed.yaml:', error);
-      throw error;
+  getNestedField(fields, fieldPath) {
+    // Navigate through nested fields using dot notation
+    // e.g., "api.dp.get" -> follows api -> dp -> get
+    const pathParts = fieldPath.split('.');
+    let currentType = null;
+
+    for (let i = 0; i < pathParts.length; i++) {
+      const fieldName = pathParts[i];
+      const field = fields[fieldName];
+
+      if (!field) {
+        return null;
+      }
+
+      if (i === pathParts.length - 1) {
+        // Last part - return the field
+        return field;
+      }
+
+      // Navigate to next level
+      const baseType = this.getBaseType(field.type);
+      if (!isObjectType(baseType)) {
+        return null;
+      }
+
+      fields = baseType.getFields();
     }
+
+    return null;
   }
 
   async fetchSchema() {
@@ -389,9 +399,93 @@ class GraphQLMCPServer {
       return properties;
   }
 
+  async setupResources() {
+    try {
+      const resourcesDir = path.join(process.cwd(), 'resources');
+
+      // Check if resources directory exists
+      let dirExists = true;
+      try {
+        await fs.access(resourcesDir);
+      } catch {
+        dirExists = false;
+      }
+
+      if (!dirExists) {
+        console.log('📁 Resources directory not found - skipping resource setup');
+        return;
+      }
+
+      // Read all files in the resources directory
+      const files = await fs.readdir(resourcesDir);
+      const markdownFiles = files.filter(file => file.endsWith('.md'));
+
+      if (markdownFiles.length === 0) {
+        console.log('📁 No markdown files found in resources directory');
+        return;
+      }
+
+      console.log(`🔍 Setting up ${markdownFiles.length} resource(s) from resources/...`);
+
+      // Load all markdown files and register them as resources
+      for (const file of markdownFiles) {
+        try {
+          const filePath = path.join(resourcesDir, file);
+          const content = await fs.readFile(filePath, 'utf8');
+
+          // Extract resource name from filename (without .md extension)
+          const resourceName = file.replace(/\.md$/, '');
+
+          // Extract the header (first line starting with #) as the display name
+          const lines = content.split('\n');
+          let displayName = resourceName;
+          for (const line of lines) {
+            if (line.startsWith('#')) {
+              displayName = line.replace(/^#+\s*/, '').trim();
+              break;
+            }
+          }
+
+          // Create resource URI
+          const resourceUri = `resources://${resourceName}`;
+
+          // Register the resource with the correct signature: registerResource(name, uri, config, readCallback)
+          this.server.registerResource(
+            displayName,  // name (used for display)
+            resourceUri,  // uri (the resource identifier)
+            {
+              description: `Resource: ${displayName}`,
+              mimeType: 'text/markdown',
+            },
+            async () => {
+              console.log(`📖 Resource read requested for: ${resourceUri}`);
+              return {
+                contents: [
+                  {
+                    uri: resourceUri,
+                    mimeType: 'text/markdown',
+                    text: content,
+                  },
+                ],
+              };
+            }
+          );
+
+          console.log(`✅ Registered resource: ${resourceUri} (${displayName})`);
+        } catch (error) {
+          console.error(`❌ Failed to register resource ${file}:`, error.message);
+        }
+      }
+
+    } catch (error) {
+      console.error('Error in setupResources:', error);
+      throw error;
+    }
+  }
+
   async setupTools() {
     try {
-      // Load exposed configuration first
+      // Load exposed configuration
       await this.loadExposedConfig();
 
       if (!this.schema) {
@@ -404,53 +498,69 @@ class GraphQLMCPServer {
 
       const queryType = this.schema.getQueryType();
       const mutationType = this.schema.getMutationType();
-      
-      const queryFieldCount = queryType ? Object.keys(queryType.getFields()).length : 0;
-      const mutationFieldCount = mutationType ? Object.keys(mutationType.getFields()).length : 0;
-      const configuredResourceCount = Object.keys(this.exposedConfig.exposed.resources).length;
-      console.log(`🛠️  Discovered ${queryFieldCount} queries, ${mutationFieldCount} mutations, and ${configuredResourceCount} configured resources`);
 
-      // Track if we need to save the config
-      let configUpdated = false;
+      // Build a set of all registered tool names to detect conflicts
+      const registeredToolNames = new Set();
 
-    if (queryType) {
-      const fields = queryType.getFields();
-      
-      for (const [fieldName, field] of Object.entries(fields)) {
-        const toolName = `${this.queryPrefix}${fieldName}`;
-        
-        // Check if this query is in the exposed config
-        if (!(fieldName in this.exposedConfig.exposed.queries)) {
-          // New query discovered, add it to config with default true
-          this.exposedConfig.exposed.queries[fieldName] = true;
-          configUpdated = true;
-          console.log(`📝 New query discovered: ${fieldName}`);
-        }
-        
-        // Only register as tool if the query is enabled
-        if (this.exposedConfig.exposed.queries[fieldName] === true) {
+      // Process Queries from exposed.yaml
+      if (queryType && this.exposedConfig.exposed.queries && this.exposedConfig.exposed.queries.length > 0) {
+        const fields = queryType.getFields();
+        console.log(`🔍 Setting up ${this.exposedConfig.exposed.queries.length} configured queries...`);
+
+        for (const fieldPath of this.exposedConfig.exposed.queries) {
           try {
+            const field = this.getNestedField(fields, fieldPath);
+
+            if (!field) {
+              console.error(`❌ Query field not found in schema: ${fieldPath}`);
+              continue;
+            }
+
+            const toolName = `${this.queryPrefix}${fieldPath.replace(/\./g, '_')}`;
             const inputSchema = this.generateInputSchema(field.args);
-            
-            // Validate the input schema before registering
+
             if (!inputSchema || typeof inputSchema !== 'object') {
               console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
-              throw new Error(`Invalid input schema generated for ${toolName}`);
+              continue;
             }
-            
+
+            const pathDisplay = fieldPath.split('.').join(' > ');
             this.server.registerTool(
               toolName,
               {
-                title: `GraphQL Query: ${fieldName}`,
+                title: `GraphQL Query: ${pathDisplay}`,
                 description: field.description || `Execute GraphQL query: ${this.getFieldDescription(field)}`,
                 inputSchema: inputSchema,
               },
               async (args) => {
                 try {
-                  console.log
-                  const query = this.buildGraphQLQuery('query', fieldName, field, args);
+                  // Build nested query that wraps through all parent fields
+                  const pathParts = fieldPath.split('.');
+                  const lastFieldName = pathParts[pathParts.length - 1];
+
+                  const variableDefinitions = field.args
+                    .map((arg) => `$${arg.name}: ${this.getTypeDescription(arg.type)}`)
+                    .join(', ');
+                  const variableUsage = field.args
+                    .map((arg) => `${arg.name}: $${arg.name}`)
+                    .join(', ');
+                  const selectionSet = this.generateSelectionSet(field.type);
+
+                  // Build nested query structure from inside out
+                  let innerQuery = `${lastFieldName}${variableUsage ? `(${variableUsage})` : ''}${selectionSet ? ` { ${selectionSet} }` : ''}`;
+
+                  // Wrap with parent fields
+                  for (let i = pathParts.length - 2; i >= 0; i--) {
+                    innerQuery = `${pathParts[i]} { ${innerQuery} }`;
+                  }
+
+                  const query = `
+                    query ${lastFieldName}${variableDefinitions ? `(${variableDefinitions})` : ''} {
+                      ${innerQuery}
+                    }
+                  `;
+
                   const result = await this.client.request(query, args);
-                  
                   return {
                     content: [
                       {
@@ -460,122 +570,85 @@ class GraphQLMCPServer {
                     ],
                   };
                 } catch (error) {
-                  console.error(`❌ GraphQL query ${fieldName} failed:`, error);
+                  console.error(`❌ GraphQL query ${fieldPath} failed:`, error);
                   throw new Error(`GraphQL query failed: ${error.message}`);
                 }
               }
             );
-            console.log(`🔧 Registered query: ${toolName}`);
+            registeredToolNames.add(toolName);
+            console.log(`✅ Registered query: ${fieldPath}`);
           } catch (error) {
-            console.error(`❌ Failed to register query tool ${toolName}:`, error);
+            console.error(`❌ Failed to register query ${fieldPath}:`, error.message);
           }
-        } else {
-          console.log(`⏭️  Skipped disabled query: ${fieldName}`);
         }
       }
-      
-      // Register resources for queries explicitly listed in resources section
-      for (const [resourceName, enabled] of Object.entries(this.exposedConfig.exposed.resources)) {
-        if (enabled === true && fields[resourceName]) {
-          const field = fields[resourceName];
-          
-          try {
-            this.server.registerResource(
-              resourceName,
-              `resource://${resourceName}`,
-              {
-                title: resourceName,
-                description: field.description || `GraphQL query resource: ${this.getFieldDescription(field)}`,
-                mimeType: 'application/json',
-              },
-              async (uri) => {
-                try {
-                  console.log(`📊 Fetching resource: ${resourceName} (${uri.href})`);
-                  const query = this.buildGraphQLQuery('query', resourceName, field, {});
-                  const result = await this.client.request(query, {});
-                  console.log(`✅ Resource fetched successfully: ${resourceName}`);
-                  
-                  return {
-                    contents: [
-                      {
-                        uri: uri.href,
-                        mimeType: 'application/json',
-                        text: JSON.stringify(result, null, 2),
-                      },
-                    ],
-                  };
-                } catch (error) {
-                  console.error(`❌ GraphQL resource ${resourceName} failed:`, error);
-                  throw new Error(`GraphQL resource failed: ${error.message}`);
-                }
-              }
-            );
-            console.log(`📊 Registered resource: ${resourceName}`);
-          } catch (error) {
-            console.error(`❌ Failed to register resource ${resourceName}:`, error);
-          }
-        } else if (enabled === true) {
-          console.log(`⚠️  Resource ${resourceName} not found in GraphQL schema`);
-        }
-      }
-      
-      // Clean up removed queries
-      const currentQueryNames = Object.keys(fields);
-      for (const queryName in this.exposedConfig.exposed.queries) {
-        if (!currentQueryNames.includes(queryName)) {
-          delete this.exposedConfig.exposed.queries[queryName];
-          configUpdated = true;
-          console.log(`🗑️  Removed obsolete query: ${queryName}`);
-        }
-      }
-      
-      // Clean up removed resources
-      for (const resourceName in this.exposedConfig.exposed.resources) {
-        if (!currentQueryNames.includes(resourceName)) {
-          delete this.exposedConfig.exposed.resources[resourceName];
-          configUpdated = true;
-          console.log(`🗑️  Removed obsolete resource: ${resourceName}`);
-        }
-      }
-    }
 
-    if (mutationType) {
-      const fields = mutationType.getFields();
-      
-      for (const [fieldName, field] of Object.entries(fields)) {
-        const toolName = `${this.mutationPrefix}${fieldName}`;
-        
-        // Check if this mutation is in the exposed config
-        if (!(fieldName in this.exposedConfig.exposed.mutations)) {
-          // New mutation discovered, add it to config with default true
-          this.exposedConfig.exposed.mutations[fieldName] = true;
-          configUpdated = true;
-          console.log(`📝 New mutation discovered: ${fieldName}`);
-        }
-        
-        // Only register if the mutation is enabled
-        if (this.exposedConfig.exposed.mutations[fieldName] === true) {
+      // Process Mutations from exposed.yaml
+      if (mutationType && this.exposedConfig.exposed.mutations && this.exposedConfig.exposed.mutations.length > 0) {
+        const fields = mutationType.getFields();
+        console.log(`🔍 Setting up ${this.exposedConfig.exposed.mutations.length} configured mutations...`);
+
+        for (const fieldPath of this.exposedConfig.exposed.mutations) {
           try {
+            const field = this.getNestedField(fields, fieldPath);
+
+            if (!field) {
+              console.error(`❌ Mutation field not found in schema: ${fieldPath}`);
+              continue;
+            }
+
+            let toolName = `${this.mutationPrefix}${fieldPath.replace(/\./g, '_')}`;
+
+            // If there's a naming conflict with a registered tool, add a _mutation suffix
+            if (registeredToolNames.has(toolName)) {
+              toolName = `${toolName}_mutation`;
+              console.log(`⚠️  Mutation name conflicts with existing tool, renamed to: ${toolName}`);
+            }
+
             const inputSchema = this.generateInputSchema(field.args);
-            
-            // Validate the input schema before registering
+
             if (!inputSchema || typeof inputSchema !== 'object') {
               console.error(`❌ Invalid input schema for ${toolName}:`, inputSchema);
-              throw new Error(`Invalid input schema generated for ${toolName}`);
+              continue;
             }
-            
+
+            const pathDisplay = fieldPath.split('.').join(' > ');
             this.server.registerTool(
               toolName,
               {
-                title: `GraphQL Mutation: ${fieldName}`,
+                title: `GraphQL Mutation: ${pathDisplay}`,
                 description: field.description || `Execute GraphQL mutation: ${this.getFieldDescription(field)}`,
                 inputSchema: inputSchema,
               },
               async (args) => {
                 try {
-                  const query = this.buildGraphQLQuery('mutation', fieldName, field, args);
+                  // Build nested query that wraps through all parent fields
+                  const pathParts = fieldPath.split('.');
+                  const lastFieldName = pathParts[pathParts.length - 1];
+
+                  const variableDefinitions = field.args
+                    .map((arg) => `$${arg.name}: ${this.getTypeDescription(arg.type)}`)
+                    .join(', ');
+                  const variableUsage = field.args
+                    .map((arg) => `${arg.name}: $${arg.name}`)
+                    .join(', ');
+                  const selectionSet = this.generateSelectionSet(field.type);
+
+                  // Build nested query structure from inside out
+                  let innerQuery = `${lastFieldName}${variableUsage ? `(${variableUsage})` : ''}${selectionSet ? ` { ${selectionSet} }` : ''}`;
+
+                  // Wrap with parent fields
+                  for (let i = pathParts.length - 2; i >= 0; i--) {
+                    innerQuery = `${pathParts[i]} { ${innerQuery} }`;
+                  }
+
+                  const query = `
+                    mutation ${lastFieldName}${variableDefinitions ? `(${variableDefinitions})` : ''} {
+                      ${innerQuery}
+                    }
+                  `;
+
                   const result = await this.client.request(query, args);
-                  
                   return {
                     content: [
                       {
@@ -585,47 +658,33 @@ class GraphQLMCPServer {
                     ],
                   };
                 } catch (error) {
-                  console.error(`❌ GraphQL mutation ${fieldName} failed:`, error);
+                  console.error(`❌ GraphQL mutation ${fieldPath} failed:`, error);
                   throw new Error(`GraphQL mutation failed: ${error.message}`);
                 }
               }
             );
-            console.log(`🔧 Registered mutation: ${toolName}`);
+            registeredToolNames.add(toolName);
+            console.log(`✅ Registered mutation: ${fieldPath}`);
           } catch (error) {
-            console.error(`❌ Failed to register mutation tool ${toolName}:`, error);
+            console.error(`❌ Failed to register mutation ${fieldPath}:`, error.message);
           }
-        } else {
-          console.log(`⏭️  Skipped disabled mutation: ${fieldName}`);
         }
       }
-      
-      // Clean up removed mutations
-      const currentMutationNames = Object.keys(fields);
-      for (const mutationName in this.exposedConfig.exposed.mutations) {
-        if (!currentMutationNames.includes(mutationName)) {
-          delete this.exposedConfig.exposed.mutations[mutationName];
-          configUpdated = true;
-          console.log(`🗑️  Removed obsolete mutation: ${mutationName}`);
-        }
-      }
-    }
-    
-    // Save configuration if it was updated
-    if (configUpdated) {
-      await this.saveExposedConfig();
-    }
     } catch (error) {
       console.error('Error in setupTools:', error);
       throw error;
     }
   }
 
-  async run(transport = 'stdio', port = 3000) {
-    // Setup tools first
+  async run(transport = 'stdio', port = 3000, host = '0.0.0.0') {
+    // Setup resources first (before tools and transport)
+    await this.setupResources();
+
+    // Setup tools
     await this.setupTools();
-    
+
     if (transport === 'http') {
-      await this.runHttpServer(port);
+      await this.runHttpServer(port, host);
     } else {
       await this.runStdioServer();
     }
@@ -642,16 +701,19 @@ class GraphQLMCPServer {
     console.error(`📋 Ready to accept MCP requests via STDIO...`);
   }
 
-  async runHttpServer(port) {
+  async runHttpServer(port, host = '0.0.0.0') {
     const app = express();
     app.use(express.json());
+
+    // Map to store transports by session ID
+    const transports = {};
 
     // Authentication middleware
     const authToken = process.env.AUTH_TOKEN;
     if (authToken) {
       app.use((req, res, next) => {
         const authHeader = req.headers.authorization;
-        
+
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
           console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Missing Bearer token`);
           return res.status(401).json({
@@ -663,7 +725,7 @@ class GraphQLMCPServer {
             id: null,
           });
         }
-        
+
         const token = authHeader.substring(7); // Remove 'Bearer ' prefix
         if (token !== authToken) {
           console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Invalid token`);
@@ -676,7 +738,7 @@ class GraphQLMCPServer {
             id: null,
           });
         }
-        
+
         next();
       });
     }
@@ -687,22 +749,48 @@ class GraphQLMCPServer {
       const userAgent = req.get('User-Agent') || 'unknown';
       const method = req.body?.method || 'unknown';
       const requestId = req.body?.id || 'N/A';
-      
+      const sessionId = req.headers['mcp-session-id'];
+
       console.log(`📨 [${timestamp}] MCP Request Received`);
       console.log(`   └── Method: ${method}`);
       console.log(`   └── Request ID: ${requestId}`);
+      console.log(`   └── Session ID: ${sessionId || 'new'}`);
       console.log(`   └── Client IP: ${clientIP}`);
       console.log(`   └── User Agent: ${userAgent.substring(0, 50)}${userAgent.length > 50 ? '...' : ''}`);
-      
+
       try {
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-        });
-        res.on('close', () => {
-          transport.close();
-          console.log(`🔌 [${new Date().toISOString()}] Connection closed for request ${requestId}`);
-        });
-        await this.server.connect(transport);
+        let transport;
+
+        if (sessionId && transports[sessionId]) {
+          // Reuse existing transport for this session
+          transport = transports[sessionId];
+          console.log(`   └── Reusing transport for session ${sessionId}`);
+        } else {
+          // Create new transport for this request
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+          });
+
+          // Connect the server to this transport
+          await this.server.connect(transport);
+
+          // Store transport by session ID if provided
+          if (sessionId) {
+            transports[sessionId] = transport;
+            console.log(`   └── Created new transport for session ${sessionId}`);
+          } else {
+            console.log(`   └── Created new stateless transport`);
+          }
+
+          // Set up cleanup when transport closes
+          transport.onclose = () => {
+            if (sessionId && transports[sessionId]) {
+              console.log(`🔌 [${new Date().toISOString()}] Transport closed for session ${sessionId}`);
+              delete transports[sessionId];
+            }
+          };
+        }
+
         await transport.handleRequest(req, res, req.body);
         console.log(`✅ [${new Date().toISOString()}] MCP Request processed successfully (${method}, ID: ${requestId})`);
       } catch (error) {
@@ -760,15 +848,16 @@ class GraphQLMCPServer {
       }));
     });
 
-    app.listen(port, () => {
+    app.listen(port, host, () => {
       const timestamp = new Date().toISOString();
       console.log(`🚀 [${timestamp}] GraphQL MCP Server Started`);
       console.log(`   └── Transport: HTTP`);
+      console.log(`   └── Host: ${host}`);
       console.log(`   └── Port: ${port}`);
       console.log(`   └── GraphQL URL: ${this.graphqlUrl}`);
       console.log(`   └── GraphQL Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
       console.log(`   └── MCP Authentication: ${authToken ? 'Bearer Token Required' : 'None (Open Access)'}`);
-      console.log(`📡 MCP endpoint: http://localhost:${port}/mcp`);
+      console.log(`📡 MCP endpoint: http://${host}:${port}/mcp`);
       console.log(`📋 Ready to accept MCP requests...`);
     });
   }
@@ -779,6 +868,7 @@ function parseArgs() {
   const config = {
     transport: 'stdio',
     port: 3000,
+    host: '0.0.0.0',
     queryPrefix: '',
     mutationPrefix: '',
     graphqlUrl: process.env.GRAPHQL_URL,
@@ -794,6 +884,10 @@ function parseArgs() {
       case '--port':
       case '-p':
         config.port = parseInt(args[++i]);
+        break;
+      case '--host':
+      case '-H':
+        config.host = args[++i];
         break;
       case '--query-prefix':
       case '-q':
@@ -821,6 +915,7 @@ Usage: node src/index.js [options]
 Options:
   -t, --transport <type>     Transport type: stdio or http (default: stdio)
   -p, --port <number>        HTTP port (default: 3000)
+  -H, --host <address>       HTTP host address (default: 0.0.0.0)
   -q, --query-prefix <str>   Prefix for query tools (default: none)
   -m, --mutation-prefix <str> Prefix for mutation tools (default: none)
   -u, --graphql-url <url>    GraphQL endpoint URL
@@ -834,6 +929,7 @@ Environment Variables:
 Examples:
   node src/index.js -u https://api.example.com/graphql  # Specify GraphQL URL
   node src/index.js -t http -u https://api.example.com/graphql  # HTTP transport
+  node src/index.js -t http -H 0.0.0.0 -u https://api.example.com/graphql  # Listen on all interfaces
   node src/index.js -u https://api.example.com/graphql -T abc123  # With Bearer token
   node src/index.js -q 'query_' -m 'mutation_' -u https://api.example.com/graphql  # With prefixes
   GRAPHQL_URL=https://api.example.com/graphql node src/index.js  # Using env var
@@ -858,4 +954,4 @@ Examples:
 
 const config = parseArgs();
 const graphqlServer = new GraphQLMCPServer(config.graphqlUrl, config.queryPrefix, config.mutationPrefix, config.token);
-graphqlServer.run(config.transport, config.port).catch(console.error);
+graphqlServer.run(config.transport, config.port, config.host).catch(console.error);
