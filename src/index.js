@@ -13,6 +13,7 @@ import {
   isScalarType,
   isObjectType,
   isEnumType,
+  isInputObjectType,
 } from 'graphql';
 import yaml from 'yaml';
 import fs from 'fs/promises';
@@ -150,8 +151,152 @@ class GraphQLMCPServer {
     const argsDesc = args.length > 0
       ? `(${args.map((arg) => `${arg.name}: ${this.getTypeDescription(arg.type)}`).join(', ')})`
       : '';
-    
+
     return `${field.name}${argsDesc}: ${this.getTypeDescription(field.type)}`;
+  }
+
+  describeInputObjectType(inputType, depth = 0) {
+    if (!isInputObjectType(inputType)) {
+      return '';
+    }
+
+    const indent = '  '.repeat(depth + 1);
+    const fields = inputType.getFields();
+    let description = `\n${indent}**${inputType.name}** Input Object:\n`;
+
+    for (const [fieldName, field] of Object.entries(fields)) {
+      const typeDesc = this.getTypeDescription(field.type);
+      const isRequired = isNonNullType(field.type);
+      const requiredLabel = isRequired ? ' (required)' : ' (optional)';
+      const baseType = this.getBaseType(field.type);
+
+      description += `${indent}  - ${fieldName} (${typeDesc})${requiredLabel}`;
+      if (field.description) {
+        description += `: ${field.description}`;
+      }
+      description += '\n';
+
+      // Recursively describe nested input object types (but limit depth to avoid infinite loops)
+      if (isInputObjectType(baseType) && depth < 3) {
+        description += this.describeInputObjectType(baseType, depth + 1);
+      } else if (isEnumType(baseType)) {
+        const values = baseType.getValues().map(v => v.name);
+        description += `${indent}    Enum values: ${values.join(', ')}\n`;
+      }
+    }
+
+    return description;
+  }
+
+  generateArgumentDocumentation(args) {
+    if (!args || args.length === 0) {
+      return 'No arguments required.';
+    }
+
+    let documentation = 'Arguments:\n';
+
+    for (const arg of args) {
+      const typeDesc = this.getTypeDescription(arg.type);
+      const isRequired = isNonNullType(arg.type);
+      const requiredLabel = isRequired ? ' (required)' : ' (optional)';
+      const baseType = this.getBaseType(arg.type);
+      let typeInfo = '';
+
+      // Add type information
+      if (isScalarType(baseType)) {
+        typeInfo = `Scalar type: ${baseType.name}`;
+      } else if (isEnumType(baseType)) {
+        const values = baseType.getValues().map(v => v.name);
+        typeInfo = `Enum type: ${baseType.name} with values: ${values.join(', ')}`;
+      } else if (isInputObjectType(baseType)) {
+        typeInfo = `Input object type: ${baseType.name}`;
+      } else if (isObjectType(baseType)) {
+        typeInfo = `Object type: ${baseType.name}`;
+      }
+
+      documentation += `  - ${arg.name} (${typeDesc})${requiredLabel}: ${arg.description || 'No description'}\n`;
+      if (typeInfo) {
+        documentation += `    Type: ${typeInfo}\n`;
+      }
+
+      // If it's an input object type, describe its structure
+      if (isInputObjectType(baseType)) {
+        documentation += this.describeInputObjectType(baseType, 0);
+      }
+    }
+
+    return documentation;
+  }
+
+  generateExampleForType(type, depth = 0) {
+    // Prevent deep recursion
+    if (depth > 5) {
+      return null;
+    }
+
+    const baseType = this.getBaseType(type);
+    const isList = this.isListTypeCheck(type);
+
+    let exampleValue = null;
+
+    // Generate appropriate example value based on type
+    if (isScalarType(baseType)) {
+      switch (baseType.name) {
+        case 'String':
+        case 'ID':
+          exampleValue = `example_value`;
+          break;
+        case 'Int':
+          exampleValue = 0;
+          break;
+        case 'Float':
+          exampleValue = 0.0;
+          break;
+        case 'Boolean':
+          exampleValue = true;
+          break;
+        default:
+          exampleValue = 'value';
+      }
+    } else if (isEnumType(baseType)) {
+      const values = baseType.getValues();
+      exampleValue = values.length > 0 ? values[0].name : 'VALUE';
+    } else if (isInputObjectType(baseType)) {
+      // Generate example for input object type
+      const fields = baseType.getFields();
+      exampleValue = {};
+
+      for (const [fieldName, field] of Object.entries(fields)) {
+        const fieldExample = this.generateExampleForType(field.type, depth + 1);
+        if (fieldExample !== null) {
+          exampleValue[fieldName] = fieldExample;
+        }
+      }
+    }
+
+    // Wrap in array if it's a list
+    if (isList && exampleValue !== null) {
+      exampleValue = [exampleValue];
+    }
+
+    return exampleValue;
+  }
+
+  generateJsonExample(args) {
+    if (!args || args.length === 0) {
+      return null;
+    }
+
+    const example = {};
+
+    for (const arg of args) {
+      const exampleValue = this.generateExampleForType(arg.type, 0);
+      if (exampleValue !== null) {
+        example[arg.name] = exampleValue;
+      }
+    }
+
+    return Object.keys(example).length > 0 ? example : null;
   }
 
   getBaseType(type) {
@@ -187,7 +332,7 @@ class GraphQLMCPServer {
 
   getJsonSchemaType(graphqlType) {
     let type = graphqlType;
-    
+
     if (isNonNullType(type)) {
       type = type.ofType;
     }
@@ -212,6 +357,37 @@ class GraphQLMCPServer {
     }
 
     return 'object';
+  }
+
+  parseArgumentValue(value, expectedType) {
+    // If the value is a string and the expected type is an object/input, try to parse it as JSON
+    if (typeof value === 'string' && (isInputObjectType(this.getBaseType(expectedType)) || isListType(this.getBaseType(expectedType)))) {
+      try {
+        return JSON.parse(value);
+      } catch (error) {
+        // If parsing fails, return the original value and let GraphQL handle the error
+        console.warn(`Failed to parse JSON string for argument: ${error.message}`);
+        return value;
+      }
+    }
+
+    return value;
+  }
+
+  parseArguments(args, fieldArgs) {
+    if (!args || !fieldArgs) {
+      return args;
+    }
+
+    const parsedArgs = { ...args };
+
+    for (const fieldArg of fieldArgs) {
+      if (fieldArg.name in parsedArgs) {
+        parsedArgs[fieldArg.name] = this.parseArgumentValue(parsedArgs[fieldArg.name], fieldArg.type);
+      }
+    }
+
+    return parsedArgs;
   }
 
   buildGraphQLQuery(operation, fieldName, field, variables) {
@@ -399,6 +575,32 @@ class GraphQLMCPServer {
       return properties;
   }
 
+  generateEnumDocumentation(enumType) {
+    const values = enumType.getValues();
+    let markdown = `# ${enumType.name} Enum\n\n`;
+
+    if (enumType.description) {
+      markdown += `${enumType.description}\n\n`;
+    }
+
+    markdown += `## Available Values\n\n`;
+
+    for (const value of values) {
+      markdown += `- **${value.name}**`;
+      if (value.description) {
+        markdown += `: ${value.description}`;
+      }
+      if (value.isDeprecated && value.deprecationReason) {
+        markdown += ` ⚠️ *Deprecated: ${value.deprecationReason}*`;
+      } else if (value.isDeprecated) {
+        markdown += ` ⚠️ *Deprecated*`;
+      }
+      markdown += '\n';
+    }
+
+    return markdown;
+  }
+
   async setupResources() {
     try {
       const resourcesDir = path.join(process.cwd(), 'resources');
@@ -413,67 +615,114 @@ class GraphQLMCPServer {
 
       if (!dirExists) {
         console.log('📁 Resources directory not found - skipping resource setup');
-        return;
-      }
+      } else {
+        // Read all files in the resources directory
+        const files = await fs.readdir(resourcesDir);
+        const markdownFiles = files.filter(file => file.endsWith('.md'));
 
-      // Read all files in the resources directory
-      const files = await fs.readdir(resourcesDir);
-      const markdownFiles = files.filter(file => file.endsWith('.md'));
+        if (markdownFiles.length > 0) {
+          console.log(`🔍 Setting up ${markdownFiles.length} resource(s) from resources/...`);
 
-      if (markdownFiles.length === 0) {
-        console.log('📁 No markdown files found in resources directory');
-        return;
-      }
+          // Load all markdown files and register them as resources
+          for (const file of markdownFiles) {
+            try {
+              const filePath = path.join(resourcesDir, file);
+              const content = await fs.readFile(filePath, 'utf8');
 
-      console.log(`🔍 Setting up ${markdownFiles.length} resource(s) from resources/...`);
+              // Extract resource name from filename (without .md extension)
+              const resourceName = file.replace(/\.md$/, '');
 
-      // Load all markdown files and register them as resources
-      for (const file of markdownFiles) {
-        try {
-          const filePath = path.join(resourcesDir, file);
-          const content = await fs.readFile(filePath, 'utf8');
+              // Extract the header (first line starting with #) as the display name
+              const lines = content.split('\n');
+              let displayName = resourceName;
+              for (const line of lines) {
+                if (line.startsWith('#')) {
+                  displayName = line.replace(/^#+\s*/, '').trim();
+                  break;
+                }
+              }
 
-          // Extract resource name from filename (without .md extension)
-          const resourceName = file.replace(/\.md$/, '');
+              // Create resource URI
+              const resourceUri = `resources://${resourceName}`;
 
-          // Extract the header (first line starting with #) as the display name
-          const lines = content.split('\n');
-          let displayName = resourceName;
-          for (const line of lines) {
-            if (line.startsWith('#')) {
-              displayName = line.replace(/^#+\s*/, '').trim();
-              break;
+              // Register the resource with the correct signature: registerResource(name, uri, config, readCallback)
+              this.server.registerResource(
+                displayName,  // name (used for display)
+                resourceUri,  // uri (the resource identifier)
+                {
+                  description: `Resource: ${displayName}`,
+                  mimeType: 'text/markdown',
+                },
+                async () => {
+                  console.log(`📖 Resource read requested for: ${resourceUri}`);
+                  return {
+                    contents: [
+                      {
+                        uri: resourceUri,
+                        mimeType: 'text/markdown',
+                        text: content,
+                      },
+                    ],
+                  };
+                }
+              );
+
+              console.log(`✅ Registered resource: ${resourceUri} (${displayName})`);
+            } catch (error) {
+              console.error(`❌ Failed to register resource ${file}:`, error.message);
             }
           }
+        } else {
+          console.log('📁 No markdown files found in resources directory');
+        }
+      }
 
-          // Create resource URI
-          const resourceUri = `resources://${resourceName}`;
+      // Register enums from GraphQL schema as resources
+      if (!this.schema) {
+        await this.fetchSchema();
+      }
 
-          // Register the resource with the correct signature: registerResource(name, uri, config, readCallback)
-          this.server.registerResource(
-            displayName,  // name (used for display)
-            resourceUri,  // uri (the resource identifier)
-            {
-              description: `Resource: ${displayName}`,
-              mimeType: 'text/markdown',
-            },
-            async () => {
-              console.log(`📖 Resource read requested for: ${resourceUri}`);
-              return {
-                contents: [
-                  {
-                    uri: resourceUri,
-                    mimeType: 'text/markdown',
-                    text: content,
-                  },
-                ],
-              };
-            }
-          );
+      const typeMap = this.schema.getTypeMap();
+      const enumTypes = Object.values(typeMap).filter(type => isEnumType(type));
 
-          console.log(`✅ Registered resource: ${resourceUri} (${displayName})`);
-        } catch (error) {
-          console.error(`❌ Failed to register resource ${file}:`, error.message);
+      if (enumTypes.length > 0) {
+        console.log(`🔍 Setting up ${enumTypes.length} GraphQL enum type(s) as resources...`);
+
+        for (const enumType of enumTypes) {
+          // Skip internal GraphQL types
+          if (enumType.name.startsWith('__')) {
+            continue;
+          }
+
+          try {
+            const content = this.generateEnumDocumentation(enumType);
+            const resourceUri = `graphql://enum/${enumType.name}`;
+
+            this.server.registerResource(
+              `Enum: ${enumType.name}`,
+              resourceUri,
+              {
+                description: `GraphQL Enum type: ${enumType.name}`,
+                mimeType: 'text/markdown',
+              },
+              async () => {
+                console.log(`📖 Enum resource read requested for: ${resourceUri}`);
+                return {
+                  contents: [
+                    {
+                      uri: resourceUri,
+                      mimeType: 'text/markdown',
+                      text: content,
+                    },
+                  ],
+                };
+              }
+            );
+
+            console.log(`✅ Registered enum: ${enumType.name}`);
+          } catch (error) {
+            console.error(`❌ Failed to register enum ${enumType.name}:`, error.message);
+          }
         }
       }
 
@@ -525,15 +774,35 @@ class GraphQLMCPServer {
             }
 
             const pathDisplay = fieldPath.split('.').join(' > ');
+
+            // Generate comprehensive description with GraphQL type info
+            const returnType = this.getTypeDescription(field.type);
+            const baseReturnType = this.getBaseType(field.type);
+            const argumentDocs = this.generateArgumentDocumentation(field.args);
+            const jsonExample = this.generateJsonExample(field.args);
+
+            let enhancedDescription = field.description || `Execute GraphQL query: ${this.getFieldDescription(field)}`;
+            enhancedDescription += `\n\n**Return Type:** ${returnType}`;
+            if (isObjectType(baseReturnType)) {
+              enhancedDescription += ` (Object type: ${baseReturnType.name})`;
+            }
+            enhancedDescription += `\n\n${argumentDocs}`;
+            if (jsonExample) {
+              enhancedDescription += `\n**Example Input (JSON structure):**\n\`\`\`json\n${JSON.stringify(jsonExample, null, 2)}\n\`\`\``;
+            }
+
             this.server.registerTool(
               toolName,
               {
                 title: `GraphQL Query: ${pathDisplay}`,
-                description: field.description || `Execute GraphQL query: ${this.getFieldDescription(field)}`,
+                description: enhancedDescription,
                 inputSchema: inputSchema,
               },
               async (args) => {
                 try {
+                  // Parse JSON string arguments to objects
+                  const parsedArgs = this.parseArguments(args, field.args);
+
                   // Build nested query that wraps through all parent fields
                   const pathParts = fieldPath.split('.');
                   const lastFieldName = pathParts[pathParts.length - 1];
@@ -560,7 +829,7 @@ class GraphQLMCPServer {
                     }
                   `;
 
-                  const result = await this.client.request(query, args);
+                  const result = await this.client.request(query, parsedArgs);
                   return {
                     content: [
                       {
@@ -613,15 +882,35 @@ class GraphQLMCPServer {
             }
 
             const pathDisplay = fieldPath.split('.').join(' > ');
+
+            // Generate comprehensive description with GraphQL type info
+            const returnType = this.getTypeDescription(field.type);
+            const baseReturnType = this.getBaseType(field.type);
+            const argumentDocs = this.generateArgumentDocumentation(field.args);
+            const jsonExample = this.generateJsonExample(field.args);
+
+            let enhancedDescription = field.description || `Execute GraphQL mutation: ${this.getFieldDescription(field)}`;
+            enhancedDescription += `\n\n**Return Type:** ${returnType}`;
+            if (isObjectType(baseReturnType)) {
+              enhancedDescription += ` (Object type: ${baseReturnType.name})`;
+            }
+            enhancedDescription += `\n\n${argumentDocs}`;
+            if (jsonExample) {
+              enhancedDescription += `\n**Example Input (JSON structure):**\n\`\`\`json\n${JSON.stringify(jsonExample, null, 2)}\n\`\`\``;
+            }
+
             this.server.registerTool(
               toolName,
               {
                 title: `GraphQL Mutation: ${pathDisplay}`,
-                description: field.description || `Execute GraphQL mutation: ${this.getFieldDescription(field)}`,
+                description: enhancedDescription,
                 inputSchema: inputSchema,
               },
               async (args) => {
                 try {
+                  // Parse JSON string arguments to objects
+                  const parsedArgs = this.parseArguments(args, field.args);
+
                   // Build nested query that wraps through all parent fields
                   const pathParts = fieldPath.split('.');
                   const lastFieldName = pathParts[pathParts.length - 1];
@@ -648,7 +937,7 @@ class GraphQLMCPServer {
                     }
                   `;
 
-                  const result = await this.client.request(query, args);
+                  const result = await this.client.request(query, parsedArgs);
                   return {
                     content: [
                       {
