@@ -986,7 +986,7 @@ class GraphQLMCPServer {
     console.error(`🚀 [${timestamp}] GraphQL MCP Server Started`);
     console.error(`   └── Transport: STDIO`);
     console.error(`   └── GraphQL URL: ${this.graphqlUrl}`);
-    console.error(`   └── Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
+    console.error(`   └── GraphQL Authentication: ${this.client.requestConfig.headers?.Authorization ? '✅ Bearer Token Set' : '❌ Not Set (GRAPHQL_TOKEN env var not provided)'}`);
     console.error(`📋 Ready to accept MCP requests via STDIO...`);
   }
 
@@ -1001,21 +1001,32 @@ class GraphQLMCPServer {
     const authToken = process.env.AUTH_TOKEN;
     if (authToken) {
       app.use((req, res, next) => {
-        const authHeader = req.headers.authorization;
+        let token = null;
 
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-          console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Missing Bearer token`);
+        // First check Authorization header
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          token = authHeader.substring(7); // Remove 'Bearer ' prefix
+        }
+
+        // If no token in header, check URL query parameter
+        if (!token && req.query.token) {
+          token = req.query.token;
+        }
+
+        if (!token) {
+          console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Missing token (checked header and URL parameter)`);
           return res.status(401).json({
             jsonrpc: '2.0',
             error: {
               code: -32001,
-              message: 'Unauthorized: Bearer token required',
+              message: 'Unauthorized: Token required (provide via Authorization header or ?token= parameter)',
             },
             id: null,
           });
         }
 
-        const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+
         if (token !== authToken) {
           console.log(`🚫 [${new Date().toISOString()}] Authentication failed - Invalid token`);
           return res.status(401).json({
@@ -1144,8 +1155,7 @@ class GraphQLMCPServer {
       console.log(`   └── Host: ${host}`);
       console.log(`   └── Port: ${port}`);
       console.log(`   └── GraphQL URL: ${this.graphqlUrl}`);
-      console.log(`   └── GraphQL Authentication: ${this.client.requestConfig.headers?.Authorization ? 'Bearer Token' : 'None'}`);
-      console.log(`   └── MCP Authentication: ${authToken ? 'Bearer Token Required' : 'None (Open Access)'}`);
+      console.log(`   └── GraphQL Authentication: ${this.client.requestConfig.headers?.Authorization ? '✅ Bearer Token Set' : '❌ Not Set (GRAPHQL_TOKEN env var not provided)'}`);
       console.log(`📡 MCP endpoint: http://${host}:${port}/mcp`);
       console.log(`📋 Ready to accept MCP requests...`);
     });
@@ -1242,5 +1252,13 @@ Examples:
 }
 
 const config = parseArgs();
+
+// Display AUTH_TOKEN status at startup
+const authToken = process.env.AUTH_TOKEN;
+console.log(`🔐 MCP Server Authentication (AUTH_TOKEN): ${authToken ? '✅ Set - Authentication Required' : '⚠️  Not Set - Open Access (No Authentication)'}`);
+if (authToken && config.transport === 'http') {
+  console.log(`   └── Auth methods: Authorization header (Bearer token) or URL parameter (?token=)`);
+}
+
 const graphqlServer = new GraphQLMCPServer(config.graphqlUrl, config.queryPrefix, config.mutationPrefix, config.token);
 graphqlServer.run(config.transport, config.port, config.host).catch(console.error);

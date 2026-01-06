@@ -188,10 +188,23 @@ environment:
   - AUTH_TOKEN=your-mcp-secret-token
 ```
 
-When `AUTH_TOKEN` is set:
-- All HTTP requests to the MCP server must include: `Authorization: Bearer your-mcp-secret-token`
+When `AUTH_TOKEN` is set, clients can authenticate using either:
+
+1. **Authorization header** (recommended):
+   ```
+   Authorization: Bearer your-mcp-secret-token
+   ```
+
+2. **URL query parameter**:
+   ```
+   http://localhost:3000/mcp?token=your-mcp-secret-token
+   ```
+
+Authentication behavior:
+- If `AUTH_TOKEN` is set, all requests must provide valid authentication
 - Requests without valid tokens receive 401 Unauthorized
 - If `AUTH_TOKEN` is not set, the server allows open access (no authentication required)
+- The server checks the Authorization header first, then falls back to the URL parameter
 
 ### HTTP API Endpoints
 
@@ -208,10 +221,15 @@ curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
 
-# With authentication (when AUTH_TOKEN is set)
+# With authentication using header (when AUTH_TOKEN is set)
 curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-mcp-secret-token" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
+
+# With authentication using URL parameter (when AUTH_TOKEN is set)
+curl -X POST "http://localhost:3000/mcp?token=your-mcp-secret-token" \
+  -H "Content-Type: application/json" \
   -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
 
 # Call a GraphQL query tool
